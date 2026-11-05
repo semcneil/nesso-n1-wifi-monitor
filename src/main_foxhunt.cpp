@@ -14,9 +14,8 @@
 #include <esp_mac.h>  // to get the full 8-byte MAC address
 #include "esp_wifi.h"
 
-#define TARGET_CHANNEL 1
-
-// Filtering state
+// State variables
+uint8_t current_channel = 6;
 bool filter_enabled = false;
 uint8_t target_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
@@ -36,7 +35,7 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
     uint8_t *dst_mac = payload + 4;
     uint8_t *src_mac = payload + 10;
 
-    // Apply dynamic MAC filter
+    // Apply dynamic MAC filter if enabled
     if (filter_enabled) {
         bool match_src = compare_mac(src_mac, target_mac);
         bool match_dst = compare_mac(dst_mac, target_mac);
@@ -59,19 +58,30 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
 void process_serial_command(String cmd) {
     cmd.trim();
     
+    // Command 1: Set Target MAC
     if (cmd.startsWith("SET_MAC:")) {
         String mac_str = cmd.substring(8);
         int parsed = sscanf(mac_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                             &target_mac[0], &target_mac[1], &target_mac[2],
                             &target_mac[3], &target_mac[4], &target_mac[5]);
-        
         if (parsed == 6) {
             filter_enabled = true;
             Serial.printf("{\"status\":\"MAC updated\",\"filter\":true}\n");
         }
-    } else if (cmd.equals("DISABLE_FILTER")) {
+    } 
+    // Command 2: Clear MAC Filter
+    else if (cmd.equals("DISABLE_FILTER")) {
         filter_enabled = false;
         Serial.printf("{\"status\":\"Filter disabled\",\"filter\":false}\n");
+    }
+    // Command 3: Dynamic Channel Switch
+    else if (cmd.startsWith("SET_CHAN:")) {
+        int new_chan = cmd.substring(9).toInt();
+        if (new_chan >= 1 && new_chan <= 13) {
+            current_channel = new_chan;
+            esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+            Serial.printf("{\"status\":\"Channel updated\",\"chan\":%d}\n", current_channel);
+        }
     }
 }
 
@@ -88,7 +98,7 @@ void setup() {
     esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_cb);
 
-    esp_wifi_set_channel(TARGET_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
 }
 
 void loop() {
