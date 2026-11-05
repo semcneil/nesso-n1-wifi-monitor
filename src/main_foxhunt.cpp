@@ -15,13 +15,30 @@
 #include "esp_wifi.h"
 #include <Preferences.h>
 
-// NVS Handler
+
+NessoBattery battery;
+NessoDisplay display;
+LGFX_Sprite statusSprite(&display);
 Preferences prefs;
 
-// Config State (stored in NVS)
+// Global Configuration & State
 uint8_t current_channel = 6;
 bool filter_enabled = false;
 uint8_t target_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// Telemetry & UI Variables
+int last_rssi = -100;
+volatile bool packet_received_flag = false;
+unsigned long last_packet_time = 0;
+unsigned long last_key_press = 0;
+unsigned long last_battery_check = 0;
+bool indicator_is_red = false;
+bool last_charging_state = false;
+
+// LED Coordinates (Landscape 240x135 layout)
+const int LED_X = 220;
+const int LED_Y = 115;
+const int LED_R = 9;
 
 bool compare_mac(const uint8_t *mac1, const uint8_t *mac2) {
     for (int i = 0; i < 6; i++) {
@@ -30,29 +47,173 @@ bool compare_mac(const uint8_t *mac1, const uint8_t *mac2) {
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// DRAW BLINKING RX LED
+// -----------------------------------------------------------------------------
+void draw_rx_led(bool is_red) {
+    uint16_t color = is_red ? TFT_RED : TFT_GREEN;
+    display.fillCircle(LED_X, LED_Y, LED_R, color);
+    display.drawCircle(LED_X, LED_Y, LED_R + 1, TFT_WHITE);
+}
+
+// -----------------------------------------------------------------------------
+// DRAW 5-BAR RSSI SIGNAL METERS DIRECTLY ON LCD
+// -----------------------------------------------------------------------------
+void draw_rssi_bars(int rssi) {
+    int start_x = 120;
+    int base_y = 125;
+    int bar_width = 4;
+    int bar_spacing = 3;
+
+    // Convert dBm to 0-5 active bar count
+    int active_bars = 0;
+    if (rssi > -90) active_bars = 1;
+    if (rssi > -80) active_bars = 2;
+    if (rssi > -70) active_bars = 3;
+    if (rssi > -60) active_bars = 4;
+    if (rssi > -50) active_bars = 5;
+
+    // Clear previous bars region
+    display.fillRect(start_x, base_y - 18, 40, 20, TFT_BLACK);
+
+    for (int i = 0; i < 5; i++) {
+        int bar_height = (i + 1) * 3 + 3; // Escalating bar heights: 6, 9, 12, 15, 18px
+        int x = start_x + i * (bar_width + bar_spacing);
+        int y = base_y - bar_height;
+
+        if (i < active_bars) {
+            uint16_t bar_color = TFT_GREEN;
+            if (active_bars <= 2) bar_color = TFT_RED;
+            else if (active_bars <= 3) bar_color = TFT_YELLOW;
+            
+            display.fillRect(x, y, bar_width, bar_height, bar_color);
+        } else {
+            display.drawRect(x, y, bar_width, bar_height, TFT_DARKGREY);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// UPDATE NUMERIC RSSI & BARS DIRECTLY ON LCD
+// -----------------------------------------------------------------------------
+void update_rssi_display() {
+    display.fillRect(5, 110, 110, 20, TFT_BLACK);
+    display.setCursor(5, 110);
+    display.setTextColor(TFT_MAGENTA);
+    display.setTextSize(2);
+    display.printf("%d dBm", last_rssi);
+
+    draw_rssi_bars(last_rssi);
+}
+
+// -----------------------------------------------------------------------------
+// RENDER FULL BASE UI FRAME
+// -----------------------------------------------------------------------------
+void render_full_ui() {
+    statusSprite.fillScreen(TFT_BLACK);
+
+    // 1. Read Battery Telemetry
+    int bat_pct = battery.getChargeLevel();
+    last_charging_state = (battery.getChargeStatus() == NessoBattery::CHARGING);
+
+    // 2. Title & Header
+    statusSprite.setCursor(5, 5);
+    statusSprite.setTextColor(TFT_WHITE);
+    statusSprite.setTextSize(2);
+    statusSprite.print("Wi-Fi Radar");
+
+    // 3. Render Battery Widget (Top Right)
+    uint16_t bat_color = (bat_pct > 20) ? TFT_GREEN : TFT_RED;
+    if (last_charging_state) bat_color = TFT_YELLOW;
+
+    int bat_x = 190;
+    int bat_y = 5;
+    statusSprite.drawRect(bat_x, bat_y, 28, 14, TFT_WHITE);
+    statusSprite.fillRect(bat_x + 28, bat_y + 4, 3, 6, TFT_WHITE);
+
+    int fill_width = map(constrain(bat_pct, 0, 100), 0, 100, 0, 24);
+    if (fill_width > 0) {
+        statusSprite.fillRect(bat_x + 2, bat_y + 2, fill_width, 10, bat_color);
+    }
+
+    statusSprite.setCursor(bat_x - 35, bat_y + 3);
+    statusSprite.setTextSize(1);
+    statusSprite.setTextColor(bat_color);
+    if (last_charging_state) {
+        statusSprite.print("CHG");
+    } else {
+        statusSprite.printf("%d%%", bat_pct);
+    }
+
+    // 4. Filter Status Badge
+    if (filter_enabled) {
+        statusSprite.fillRect(5, 28, 80, 18, TFT_GREEN);
+        statusSprite.setCursor(10, 33);
+        statusSprite.setTextColor(TFT_BLACK);
+        statusSprite.setTextSize(1);
+        statusSprite.print("FILTER: ON");
+    } else {
+        statusSprite.fillRect(5, 28, 80, 18, TFT_RED);
+        statusSprite.setCursor(10, 33);
+        statusSprite.setTextColor(TFT_WHITE);
+        statusSprite.setTextSize(1);
+        statusSprite.print("FILTER: OFF");
+    }
+
+    // 5. Channel Display
+    statusSprite.setCursor(5, 52);
+    statusSprite.setTextColor(TFT_CYAN);
+    statusSprite.setTextSize(2);
+    statusSprite.printf("Channel: %d", current_channel);
+
+    // 6. Target MAC Display
+    statusSprite.setCursor(5, 74);
+    statusSprite.setTextColor(TFT_YELLOW);
+    statusSprite.setTextSize(1);
+    statusSprite.print("Target MAC:");
+
+    statusSprite.setCursor(5, 86);
+    statusSprite.setTextColor(TFT_WHITE);
+    statusSprite.setTextSize(2);
+    statusSprite.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                        target_mac[0], target_mac[1], target_mac[2],
+                        target_mac[3], target_mac[4], target_mac[5]);
+
+    // Push base sprite
+    statusSprite.pushSprite(0, 0);
+
+    // Overlay live direct elements
+    update_rssi_display();
+    draw_rx_led(indicator_is_red);
+}
+
+// -----------------------------------------------------------------------------
+// PROMISCUOUS PACKET CALLBACK
+// -----------------------------------------------------------------------------
 void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
-    
     if (pkt->rx_ctrl.sig_len < 16) return;
 
     uint8_t *payload = pkt->payload;
     uint8_t *dst_mac = payload + 4;
     uint8_t *src_mac = payload + 10;
 
-    // Apply dynamic MAC filter if enabled
     if (filter_enabled) {
         bool match_src = compare_mac(src_mac, target_mac);
         bool match_dst = compare_mac(dst_mac, target_mac);
         if (!match_src && !match_dst) return;
     }
 
-    int rssi = pkt->rx_ctrl.rssi;
+    last_rssi = pkt->rx_ctrl.rssi;
+    packet_received_flag = true;
+    last_packet_time = millis();
+
     uint8_t channel = pkt->rx_ctrl.channel;
     uint8_t frame_type = payload[0] & 0xFC;
     bool is_wifi6 = (pkt->rx_ctrl.he_siga1 != 0) || (pkt->rx_ctrl.he_siga2 != 0);
 
     Serial.printf("{\"rssi\":%d,\"chan\":%d,\"src\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"dst\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"type\":%d,\"is_wifi6\":%s}\n",
-                  rssi, channel, 
+                  last_rssi, channel, 
                   src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
                   dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5],
                   frame_type, 
@@ -61,8 +222,6 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
 
 void process_serial_command(String cmd) {
     cmd.trim();
-    
-    // Response to GET_STATUS request from Python when it misses the boot payload
     if (cmd.equals("GET_STATUS")) {
         Serial.printf("{\"status_resp\":true,\"chan\":%d,\"filter\":%s,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}\n",
                       current_channel,
@@ -70,7 +229,6 @@ void process_serial_command(String cmd) {
                       target_mac[0], target_mac[1], target_mac[2], target_mac[3], target_mac[4], target_mac[5]);
         return;
     }
-
     if (cmd.startsWith("SET_MAC:")) {
         String mac_str = cmd.substring(8);
         int parsed = sscanf(mac_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
@@ -82,7 +240,7 @@ void process_serial_command(String cmd) {
             prefs.putBytes("target_mac", target_mac, 6);
             prefs.putBool("filter_en", true);
             prefs.end();
-            Serial.printf("{\"status\":\"MAC updated & saved\",\"filter\":true}\n");
+            render_full_ui();
         }
     } 
     else if (cmd.equals("DISABLE_FILTER")) {
@@ -90,7 +248,7 @@ void process_serial_command(String cmd) {
         prefs.begin("wifi_config", false);
         prefs.putBool("filter_en", false);
         prefs.end();
-        Serial.printf("{\"status\":\"Filter disabled & saved\",\"filter\":false}\n");
+        render_full_ui();
     }
     else if (cmd.startsWith("SET_CHAN:")) {
         int new_chan = cmd.substring(9).toInt();
@@ -100,47 +258,84 @@ void process_serial_command(String cmd) {
             prefs.begin("wifi_config", false);
             prefs.putUChar("channel", current_channel);
             prefs.end();
-            Serial.printf("{\"status\":\"Channel updated & saved\",\"chan\":%d}\n", current_channel);
+            render_full_ui();
         }
     }
 }
 
+// -----------------------------------------------------------------------------
+// SETUP & MAIN LOOP
+// -----------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(4000);
+    while (!Serial && millis() < 2000);
 
-    // -------------------------------------------------------------------------
-    // Load Settings from Non-Volatile Storage (NVS)
-    // -------------------------------------------------------------------------
-    prefs.begin("wifi_config", true); // Open in Read-Only mode first
-    current_channel = prefs.getUChar("channel", 6); // Default to Ch 6
-    filter_enabled = prefs.getBool("filter_en", false); // Default to false
-    prefs.getBytes("target_mac", target_mac, 6); // Read 6 bytes for MAC
+    battery.begin();
+    display.begin();
+    
+    display.setRotation(1); // Use 3 if screen is upside-down
+    statusSprite.createSprite(display.width(), display.height());
+
+    pinMode(KEY1, INPUT_PULLUP);
+
+    prefs.begin("wifi_config", true);
+    current_channel = prefs.getUChar("channel", 6);
+    filter_enabled = prefs.getBool("filter_en", false);
+    prefs.getBytes("target_mac", target_mac, 6);
     prefs.end();
 
-    // WiFi initialization
+    render_full_ui();
+
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
     esp_wifi_set_promiscuous(true);
-
     wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_cb);
-
-    // Apply restored channel setting
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
-
-    // Output startup config log over Serial
-    Serial.printf("{\"boot\":true,\"chan\":%d,\"filter\":%s,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}\n",
-                  current_channel,
-                  filter_enabled ? "true" : "false",
-                  target_mac[0], target_mac[1], target_mac[2], target_mac[3], target_mac[4], target_mac[5]);
 }
 
 void loop() {
+    // 1. KEY1 Filter Toggle
+    if (digitalRead(KEY1) == LOW && (millis() - last_key_press > 250)) {
+        last_key_press = millis();
+        filter_enabled = !filter_enabled;
+        prefs.begin("wifi_config", false);
+        prefs.putBool("filter_en", filter_enabled);
+        prefs.end();
+        render_full_ui();
+    }
+
+    // 2. Incoming Serial Commands
     if (Serial.available()) {
         String input = Serial.readStringUntil('\n');
         process_serial_command(input);
+    }
+
+    // 3. Periodic Battery & Power State Refresh (Every 2 seconds)
+    if (millis() - last_battery_check > 2000) {
+        last_battery_check = millis();
+        bool is_chg = (battery.getChargeStatus() == NessoBattery::CHARGING);
+        if (is_chg != last_charging_state) {
+            render_full_ui(); // Instantly update header when USB cable is unplugged/plugged in
+        }
+    }
+
+    // 4. Packet RX Blinking LED & Bar Meter Updates
+    if (packet_received_flag) {
+        packet_received_flag = false;
+        
+        if (!indicator_is_red) {
+            indicator_is_red = true;
+            draw_rx_led(true);
+        }
+        update_rssi_display();
+    }
+
+    // Reset LED to GREEN after 120ms of packet inactivity
+    if (indicator_is_red && (millis() - last_packet_time > 120)) {
+        indicator_is_red = false;
+        draw_rx_led(false);
     }
 }
