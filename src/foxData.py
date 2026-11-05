@@ -42,13 +42,13 @@ class SerialThread(QtCore.QThread):
 class WiFiVisualizer(QtWidgets.QMainWindow):
     def __init__(self, serial_port):
         super().__init__()
-        self.setWindowTitle("Wi-Fi Signal Radar — ESP32-C6 Dynamic Filter")
+        self.setWindowTitle("Wi-Fi Signal Radar — Dynamic MAC & Channel Control")
         self.resize(1100, 650)
 
         self.history_len = 100
         self.rssi_history = collections.deque(maxlen=self.history_len)
 
-        # Central widget and main vertical layout
+        # Central Widget & Main Layout
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QVBoxLayout(central_widget)
@@ -56,21 +56,30 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
         # Control Panel (Top Bar)
         control_panel = QtWidgets.QHBoxLayout()
         
+        # Channel Selector Dropdown
+        control_panel.addWidget(QtWidgets.QLabel("Channel:"))
+        self.channel_box = QtWidgets.QComboBox()
+        for ch in range(1, 14):
+            self.channel_box.addItem(f"Channel {ch}", ch)
+        self.channel_box.setCurrentIndex(5)  # Default Channel 6
+        self.channel_box.currentIndexChanged.connect(self.update_channel)
+        control_panel.addWidget(self.channel_box)
+
+        # MAC Filter Inputs
+        control_panel.addWidget(QtWidgets.QLabel("Target MAC:"))
         self.mac_input = QtWidgets.QLineEdit()
         self.mac_input.setPlaceholderText("e.g. AA:BB:CC:DD:EE:FF")
-        
-        self.btn_set_mac = QtWidgets.QPushButton("Set Target MAC")
-        self.btn_set_mac.clicked.connect(self.update_target_mac)
-
-        self.btn_clear_filter = QtWidgets.QPushButton("Show All Traffic")
-        self.btn_clear_filter.clicked.connect(self.clear_filter)
-
-        self.status_label = QtWidgets.QLabel("Filter: OFF (Capturing All)")
-
-        control_panel.addWidget(QtWidgets.QLabel("Target MAC:"))
         control_panel.addWidget(self.mac_input)
+        
+        self.btn_set_mac = QtWidgets.QPushButton("Set MAC")
+        self.btn_set_mac.clicked.connect(self.update_target_mac)
         control_panel.addWidget(self.btn_set_mac)
+
+        self.btn_clear_filter = QtWidgets.QPushButton("Clear Filter")
+        self.btn_clear_filter.clicked.connect(self.clear_filter)
         control_panel.addWidget(self.btn_clear_filter)
+
+        self.status_label = QtWidgets.QLabel("Status: Connected (Ch 6)")
         control_panel.addWidget(self.status_label)
         
         main_layout.addLayout(control_panel)
@@ -87,18 +96,24 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
         self.thread.data_received.connect(self.process_packet)
         self.thread.start()
 
+    def update_channel(self):
+        selected_chan = self.channel_box.currentData()
+        self.thread.send_command(f"SET_CHAN:{selected_chan}")
+        self.status_label.setText(f"Status: Switched to Channel {selected_chan}")
+        self.rssi_history.clear()
+
     def update_target_mac(self):
         mac_text = self.mac_input.text().strip().upper()
         if len(mac_text) == 17 and mac_text.count(':') == 5:
             self.thread.send_command(f"SET_MAC:{mac_text}")
-            self.status_label.setText(f"Filter: ON ({mac_text})")
+            self.status_label.setText(f"Status: Filtering MAC ({mac_text})")
             self.rssi_history.clear()
         else:
             self.status_label.setText("Error: Invalid MAC format!")
 
     def clear_filter(self):
         self.thread.send_command("DISABLE_FILTER")
-        self.status_label.setText("Filter: OFF (Capturing All)")
+        self.status_label.setText("Status: Capturing All MACs")
 
     @QtCore.pyqtSlot(dict)
     def process_packet(self, data):
