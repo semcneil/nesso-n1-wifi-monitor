@@ -8,6 +8,7 @@ import pyqtgraph as pg
 
 class SerialThread(QtCore.QThread):
     data_received = QtCore.pyqtSignal(dict)
+    connection_failed = QtCore.pyqtSignal(str)
 
     def __init__(self, port, baud=115200):
         super().__init__()
@@ -33,34 +34,50 @@ class SerialThread(QtCore.QThread):
                         self.data_received.emit(data)
                     except json.JSONDecodeError:
                         pass
-            self.ser.close()
+            if self.ser and self.ser.is_open:
+                self.ser.close()
         except Exception as e:
-            print(f"Serial Error: {e}")
+            self.connection_failed.emit(str(e))
 
     def send_command(self, cmd_str):
         if self.ser and self.ser.is_open:
-            self.ser.write((cmd_str + "\n").encode('utf-8'))
+            try:
+                self.ser.write((cmd_str + "\n").encode('utf-8'))
+            except Exception as e:
+                print(f"Failed to send command: {e}")
 
     def stop(self):
         self.running = False
         self.wait()
 
 class WiFiVisualizer(QtWidgets.QMainWindow):
-    def __init__(self, serial_port):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("Wi-Fi Signal Radar — ESP32-C6 Auto-Syncing GUI")
-        self.resize(1100, 650)
+        self.resize(1200, 650)
 
         self.history_len = 100
         self.rssi_history = collections.deque(maxlen=self.history_len)
         self.is_synced = False  
+        self.thread = None
 
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QVBoxLayout(central_widget)
 
+        # Control Panel (Top Bar)
         control_panel = QtWidgets.QHBoxLayout()
-        
+
+        # 1. Serial Port Dropdown & Connect Button
+        control_panel.addWidget(QtWidgets.QLabel("Port:"))
+        self.port_box = QtWidgets.QComboBox()
+        control_panel.addWidget(self.port_box)
+
+        self.btn_connect = QtWidgets.QPushButton("Connect")
+        self.btn_connect.clicked.connect(self.connect_serial_port)
+        control_panel.addWidget(self.btn_connect)
+
+        # 2. Channel Selector Dropdown
         control_panel.addWidget(QtWidgets.QLabel("Channel:"))
         self.channel_box = QtWidgets.QComboBox()
         for ch in range(1, 14):
@@ -68,6 +85,7 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
         self.channel_box.currentIndexChanged.connect(self.user_changed_channel)
         control_panel.addWidget(self.channel_box)
 
+        # 3. MAC Filter Inputs
         control_panel.addWidget(QtWidgets.QLabel("Target MAC:"))
         self.mac_input = QtWidgets.QLineEdit()
         self.mac_input.setPlaceholderText("e.g. AA:BB:CC:DD:EE:FF")
@@ -81,27 +99,74 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
         self.btn_clear_filter.clicked.connect(self.user_clear_filter)
         control_panel.addWidget(self.btn_clear_filter)
 
-        self.status_label = QtWidgets.QLabel("Status: Connecting & Syncing...")
+        self.status_label = QtWidgets.QLabel("Status: Select port and connect")
         control_panel.addWidget(self.status_label)
         
         main_layout.addLayout(control_panel)
 
+        # Signal Plot
         self.rssi_plot = pg.PlotWidget(title="Live Target RSSI Stream (dBm)")
         self.rssi_plot.setYRange(-100, -20)
         self.rssi_plot.setLabel('left', 'RSSI', units='dBm')
         self.rssi_curve = self.rssi_plot.plot(pen=pg.mkPen('g', width=2))
         main_layout.addWidget(self.rssi_plot)
 
-        # Start Serial Thread
-        self.thread = SerialThread(serial_port)
+        # Populate Serial Ports & Auto-Connect
+        self.populate_serial_ports()
+
+    def populate_serial_ports(self):
+        """Scans system serial ports and selects the first 'usbmodem' device by default."""
+        self.port_box.clear()
+        ports = serial.tools.list_ports.comports()
+        
+        if not ports:
+            self.status_label.setText("Status: No serial ports detected!")
+            return
+
+        usbmodem_index = -1
+        for idx, p in enumerate(ports):
+            port_name = p.device
+            display_name = f"{port_name} ({p.description})" if p.description else port_name
+            self.port_box.addItem(display_name, port_name)
+
+            # Look for 'usbmodem' in port path or description
+            if "usbmodem" in port_name.lower() or "usbmodem" in (p.description or "").lower():
+                if usbmodem_index == -1:
+                    usbmodem_index = idx
+
+        # Set default selection: 'usbmodem' if found, otherwise index 0
+        default_index = usbmodem_index if usbmodem_index != -1 else 0
+        self.port_box.setCurrentIndex(default_index)
+
+        # Auto-start connection on launch
+        self.connect_serial_port()
+
+    def connect_serial_port(self):
+        """Starts or restarts the serial reading thread on the chosen port."""
+        if self.thread and self.thread.isRunning():
+            self.thread.stop()
+
+        selected_port = self.port_box.currentData()
+        if not selected_port:
+            self.status_label.setText("Error: No port selected!")
+            return
+
+        self.is_synced = False
+        self.status_label.setText(f"Status: Connecting to {selected_port}...")
+
+        self.thread = SerialThread(selected_port)
         self.thread.data_received.connect(self.process_packet)
+        self.thread.connection_failed.connect(self.on_connection_failed)
         self.thread.start()
 
-        # Fallback timer: Request state if no boot packet received within 1.5s
+        # Fallback timer: Request status if no boot packet received within 1.5s
         QtCore.QTimer.singleShot(1500, self.request_status_ping)
 
+    def on_connection_failed(self, error_msg):
+        self.status_label.setText(f"Error: {error_msg}")
+
     def request_status_ping(self):
-        if not self.is_synced:
+        if self.thread and not self.is_synced:
             self.thread.send_command("GET_STATUS")
 
     @QtCore.pyqtSlot(dict)
@@ -111,7 +176,7 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
             self.sync_gui_from_boot(data)
             return
 
-        # 2. If receiving normal telemetry before sync, unlock GUI with defaults
+        # 2. Handle Telemetry Packets
         if 'rssi' in data and not self.is_synced:
             self.is_synced = True
             self.status_label.setText("Status: Connected (Streaming)")
@@ -141,7 +206,7 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
         self.is_synced = True
 
     def user_changed_channel(self):
-        if not self.is_synced:
+        if not self.is_synced or not self.thread:
             return
         selected_chan = self.channel_box.currentData()
         self.thread.send_command(f"SET_CHAN:{selected_chan}")
@@ -149,6 +214,8 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
         self.rssi_history.clear()
 
     def user_set_mac(self):
+        if not self.thread:
+            return
         mac_text = self.mac_input.text().strip().upper()
         if len(mac_text) == 17 and mac_text.count(':') == 5:
             self.thread.send_command(f"SET_MAC:{mac_text}")
@@ -158,30 +225,19 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
             self.status_label.setText("Error: Invalid MAC format!")
 
     def user_clear_filter(self):
+        if not self.thread:
+            return
         self.thread.send_command("DISABLE_FILTER")
         self.status_label.setText("Status: Capturing All MACs")
 
     def closeEvent(self, event):
-        self.thread.stop()
+        if self.thread:
+            self.thread.stop()
         event.accept()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    if not ports:
-        print("No serial ports found! Connect your Nesso N1.")
-        return
-
-    print("Available ports:", ports)
-    try:
-        port = [x for x in ports if "usbmodem" in x][0]
-    except IndexError as e:
-        print("No usbmodem found, quitting")
-        return
-    selected_port = port  # Default to first available port
-    print(f"Connecting to {selected_port}...") 
-
-    win = WiFiVisualizer(selected_port)
+    win = WiFiVisualizer()
     win.show()
     sys.exit(app.exec_())
 
