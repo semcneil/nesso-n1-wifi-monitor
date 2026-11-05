@@ -77,7 +77,12 @@ class WiFiVisualizer(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(dict)
     def process_packet(self, data):
-        # Record RSSI
+        is_ax = data.get('is_wifi6', False)
+        # protocol_str = "802.11ax (Wi-Fi 6)" if is_ax else "802.11b/g/n"
+            
+        # Print or trigger specific UI elements when a Wi-Fi 6 frame arrives
+        if is_ax:
+            print(f"[Wi-Fi 6 Frame Captured] MAC: {data['mac']} | Channel: {data['chan']}")        # Record RSSI
         self.rssi_history.append(data['rssi'])
         self.rssi_curve.setData(list(self.rssi_history))
 
