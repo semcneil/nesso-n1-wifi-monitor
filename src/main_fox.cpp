@@ -5,11 +5,6 @@
   2026 August 17
 */
 
-/*
-  main_fox.cpp — Wi-Fi Tracking Beacon & MQTT Telemetry Transmitter
-  Arduino Nesso N1 (ESP32-C6)
-*/
-
 #include <Arduino.h>
 #include <Arduino_Nesso_N1.h>
 #include <WiFi.h>
