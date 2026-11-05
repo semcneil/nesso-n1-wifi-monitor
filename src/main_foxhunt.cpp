@@ -14,33 +14,64 @@
 #include <esp_mac.h>  // to get the full 8-byte MAC address
 #include "esp_wifi.h"
 
-void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
-    if (type == WIFI_PKT_MGMT || type == WIFI_PKT_DATA || type == WIFI_PKT_CTRL || type == WIFI_PKT_MISC) {
-        wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
-        
-        int rssi = pkt->rx_ctrl.rssi;
-        uint8_t channel = pkt->rx_ctrl.channel;
-        
-        // Detect Wi-Fi 6 (802.11ax) frames on ESP32-C6 Arduino core
-        // 1. he_siga1 / he_siga2 are non-zero when HE (Wi-Fi 6) preamble is decoded
-        // 2. rate > 0x80 indicates HE MCS rate encoding in ESP-IDF
-        bool is_wifi6 = (pkt->rx_ctrl.he_siga1 != 0) || (pkt->rx_ctrl.he_siga2 != 0);
+#define TARGET_CHANNEL 1
 
-        // Extract Source MAC Address (bytes 10 to 15 of 802.11 header)
-        uint8_t *payload = pkt->payload;
-        uint8_t *mac = payload + 10;
-        uint8_t frame_type = payload[0] & 0xFC;
-        uint8_t testMac[] = {0x48,0xF6,0xEE,0xC4,0xAE,0xB4};
+// Filtering state
+bool filter_enabled = false;
+uint8_t target_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+bool compare_mac(const uint8_t *mac1, const uint8_t *mac2) {
+    for (int i = 0; i < 6; i++) {
+        if (mac1[i] != mac2[i]) return false;
+    }
+    return true;
+}
+
+void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+    
+    if (pkt->rx_ctrl.sig_len < 16) return;
+
+    uint8_t *payload = pkt->payload;
+    uint8_t *dst_mac = payload + 4;
+    uint8_t *src_mac = payload + 10;
+
+    // Apply dynamic MAC filter
+    if (filter_enabled) {
+        bool match_src = compare_mac(src_mac, target_mac);
+        bool match_dst = compare_mac(dst_mac, target_mac);
+        if (!match_src && !match_dst) return;
+    }
+
+    int rssi = pkt->rx_ctrl.rssi;
+    uint8_t channel = pkt->rx_ctrl.channel;
+    uint8_t frame_type = payload[0] & 0xFC;
+    bool is_wifi6 = (pkt->rx_ctrl.he_siga1 != 0) || (pkt->rx_ctrl.he_siga2 != 0);
+
+    Serial.printf("{\"rssi\":%d,\"chan\":%d,\"src\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"dst\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"type\":%d,\"is_wifi6\":%s}\n",
+                  rssi, channel, 
+                  src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
+                  dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5],
+                  frame_type, 
+                  is_wifi6 ? "true" : "false");
+}
+
+void process_serial_command(String cmd) {
+    cmd.trim();
+    
+    if (cmd.startsWith("SET_MAC:")) {
+        String mac_str = cmd.substring(8);
+        int parsed = sscanf(mac_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                            &target_mac[0], &target_mac[1], &target_mac[2],
+                            &target_mac[3], &target_mac[4], &target_mac[5]);
         
-        // check for specific MAC address
-        if(mac[0] == testMac[0]) {
-            // Stream clean JSON over USB Serial
-            Serial.printf("{\"rssi\":%d,\"chan\":%d,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"type\":%d,\"is_wifi6\":%s}\n",
-                        rssi, channel, 
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
-                        frame_type, 
-                        is_wifi6 ? "true" : "false");
+        if (parsed == 6) {
+            filter_enabled = true;
+            Serial.printf("{\"status\":\"MAC updated\",\"filter\":true}\n");
         }
+    } else if (cmd.equals("DISABLE_FILTER")) {
+        filter_enabled = false;
+        Serial.printf("{\"status\":\"Filter disabled\",\"filter\":false}\n");
     }
 }
 
@@ -51,26 +82,19 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
-    // These are taken care of with WiFi.mode and disconnect
-    // wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    // esp_wifi_init(&cfg);
-    // esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    // esp_wifi_set_mode(WIFI_MODE_STA);
-    // esp_wifi_start();
-
     esp_wifi_set_promiscuous(true);
+
+    wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
+    esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_cb);
 
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_channel(TARGET_CHANNEL, WIFI_SECOND_CHAN_NONE);
 }
 
 void loop() {
-    // static uint8_t channel = 1;
-    // static unsigned long last_hop = 0;
-
-    // if (millis() - last_hop > 250) {
-    //     last_hop = millis();
-    //     channel = (channel % 13) + 1;
-    //     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    // }
+    // Read incoming commands over Serial
+    if (Serial.available()) {
+        String input = Serial.readStringUntil('\n');
+        process_serial_command(input);
+    }
 }
