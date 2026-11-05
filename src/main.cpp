@@ -15,7 +15,7 @@
 #include "esp_wifi.h"
 
 void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
-    if (type == WIFI_PKT_MGMT || type == WIFI_PKT_DATA) {
+    if (type == WIFI_PKT_MGMT || type == WIFI_PKT_DATA || type == WIFI_PKT_CTRL || type == WIFI_PKT_MISC) {
         wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
         
         int rssi = pkt->rx_ctrl.rssi;
@@ -30,13 +30,17 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
         uint8_t *payload = pkt->payload;
         uint8_t *mac = payload + 10;
         uint8_t frame_type = payload[0] & 0xFC;
-
-        // Stream clean JSON over USB Serial
-        Serial.printf("{\"rssi\":%d,\"chan\":%d,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"type\":%d,\"is_wifi6\":%s}\n",
-                      rssi, channel, 
-                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
-                      frame_type, 
-                      is_wifi6 ? "true" : "false");
+        uint8_t testMac[] = {0x48,0xF6,0xEE,0xC4,0xAE,0xB4};
+        
+        // check for specific MAC address
+        if(mac[0] == testMac[0]) {
+            // Stream clean JSON over USB Serial
+            Serial.printf("{\"rssi\":%d,\"chan\":%d,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"type\":%d,\"is_wifi6\":%s}\n",
+                        rssi, channel, 
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 
+                        frame_type, 
+                        is_wifi6 ? "true" : "false");
+        }
     }
 }
 
@@ -47,23 +51,26 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_start();
+    // These are taken care of with WiFi.mode and disconnect
+    // wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    // esp_wifi_init(&cfg);
+    // esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    // esp_wifi_set_mode(WIFI_MODE_STA);
+    // esp_wifi_start();
 
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_cb);
+
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 }
 
 void loop() {
-    static uint8_t channel = 1;
-    static unsigned long last_hop = 0;
+    // static uint8_t channel = 1;
+    // static unsigned long last_hop = 0;
 
-    if (millis() - last_hop > 250) {
-        last_hop = millis();
-        channel = (channel % 13) + 1;
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    }
+    // if (millis() - last_hop > 250) {
+    //     last_hop = millis();
+    //     channel = (channel % 13) + 1;
+    //     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    // }
 }
