@@ -1,0 +1,7 @@
+colorama==0.4.6
+numpy==2.5.4
+pyqt5==5.15.11
+pyqt5-qt5==5.15.19
+pyqt5-sip==12.20.0
+pyqtgraph==0.14.0
+pyserial==3.5
